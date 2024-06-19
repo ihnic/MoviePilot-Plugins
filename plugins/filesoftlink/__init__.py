@@ -5,7 +5,7 @@ import shutil
 import threading
 import traceback
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Dict, Any, Optional
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -43,22 +43,26 @@ class FileMonitorHandler(FileSystemEventHandler):
         self.sync.event_handler(event=event, text="移动",
                                 mon_path=self._watch_path, event_path=event.dest_path)
 
+    def on_deleted(self, event):
+        self.sync.event_handler(event=event, text="删除",
+                                mon_path=self._watch_path, event_path=event.src_path)
+
 
 class FileSoftLink(_PluginBase):
     # 插件名称
-    plugin_name = "实时软连接"
+    plugin_name = "实时软连接（魔改版）"
     # 插件描述
     plugin_desc = "监控目录文件变化，媒体文件软连接，其他文件可选复制。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/softlink.png"
     # 插件版本
-    plugin_version = "1.3"
+    plugin_version = "1.0"
     # 插件作者
-    plugin_author = "thsrite"
+    plugin_author = "nic"
     # 作者主页
-    author_url = "https://github.com/thsrite"
+    author_url = "https://github.com/ihnic"
     # 插件配置项ID前缀
-    plugin_config_prefix = "filesoftlink_"
+    plugin_config_prefix = "filesoftlink1_"
     # 加载顺序
     plugin_order = 10
     # 可使用的用户级别
@@ -237,378 +241,113 @@ class FileSoftLink(_PluginBase):
         """
         立即运行一次，全量同步目录中所有文件
         """
-        logger.info("开始全量同步监控目录 ...")
-        # 遍历所有监控目录
-        for mon_path in self._dirconf.keys():
-            # 遍历目录下所有文件
-            for file_path in SystemUtils.list_files(Path(mon_path), ['.*']):
-                self.__handle_file(event_path=str(file_path), mon_path=mon_path)
-        logger.info("全量同步监控目录完成！")
+        for mon_path, target_path in self._dirconf.items():
+            logger.info(f"开始同步监控目录：{mon_path}")
+            for path in Path(mon_path).rglob('*'):
+                if path.is_file():
+                    self.__handle_file(path, mon_path, target_path)
 
-    def event_handler(self, event, mon_path: str, text: str, event_path: str):
+    def event_handler(self, event, text, mon_path, event_path):
         """
-        处理文件变化
-        :param event: 事件
-        :param mon_path: 监控目录
-        :param text: 事件描述
-        :param event_path: 事件文件路径
+        事件处理
         """
-        if not event.is_directory:
-            # 文件发生变化
-            logger.debug("文件%s：%s" % (text, event_path))
-            self.__handle_file(event_path=event_path, mon_path=mon_path)
-
-    def __handle_file(self, event_path: str, mon_path: str):
-        """
-        同步一个文件
-        :param event_path: 事件文件路径
-        :param mon_path: 监控目录
-        """
-        file_path = Path(event_path)
-        try:
-            if not file_path.exists():
-                return
-            # 全程加锁
-            with lock:
-                # 回收站及隐藏的文件不处理
-                if event_path.find('/@Recycle/') != -1 \
-                        or event_path.find('/#recycle/') != -1 \
-                        or event_path.find('/.') != -1 \
-                        or event_path.find('/@eaDir') != -1:
-                    logger.debug(f"{event_path} 是回收站或隐藏的文件")
+        with lock:
+            try:
+                logger.info(f"{event_path} {text}事件")
+                # 跳过云盘临时文件
+                if not Path(event_path).exists() and text != "删除":
+                    return
+                # 跳过大于指定大小的文件
+                if self._size > 0 and Path(event_path).exists() and os.path.getsize(event_path) > self._size * 1024 * 1024:
+                    logger.info(f"{event_path} 文件大小超过限制，跳过")
                     return
 
-                # 命中过滤关键字不处理
-                if self._exclude_keywords:
-                    for keyword in self._exclude_keywords.split("\n"):
-                        if keyword and re.findall(keyword, event_path):
-                            logger.info(f"{event_path} 命中过滤关键字 {keyword}，不处理")
-                            return
-
-                # 整理屏蔽词不处理
-                transfer_exclude_words = self.systemconfig.get(SystemConfigKey.TransferExcludeWords)
-                if transfer_exclude_words:
-                    for keyword in transfer_exclude_words:
-                        if not keyword:
-                            continue
-                        if keyword and re.search(r"%s" % keyword, event_path, re.IGNORECASE):
-                            logger.info(f"{event_path} 命中整理屏蔽词 {keyword}，不处理")
-                            return
-
-                # 判断是不是蓝光目录
-                if re.search(r"BDMV[/\\]STREAM", event_path, re.IGNORECASE):
-                    # 截取BDMV前面的路径
-                    blurray_dir = event_path[:event_path.find("BDMV")]
-                    file_path = Path(blurray_dir)
-                    logger.info(f"{event_path} 是蓝光目录，更正文件路径为：{str(file_path)}")
-
-                # 判断文件大小
-                if self._size and float(self._size) > 0 and file_path.stat().st_size < float(self._size) * 1024 ** 3:
-                    logger.info(f"{file_path} 文件大小小于监控文件大小，不处理")
+                # 跳过排除的文件或目录
+                if self._exclude_keywords and re.findall(self._exclude_keywords, event_path, re.IGNORECASE):
+                    logger.info(f"{event_path} 匹配排除关键字，跳过")
                     return
 
-                # 查询转移目的目录
-                target: Path = self._dirconf.get(mon_path)
-                target_file = str(file_path).replace(str(mon_path), str(target))
-
-                # 如果是文件夹
-                if Path(target_file).is_dir():
-                    if not Path(target_file).exists():
-                        logger.info(f"创建目标文件夹 {target_file}")
-                        os.makedirs(target_file)
-                        return
+                # 软链接或复制文件
+                if text == "删除":
+                    self.__handle_delete(event_path, mon_path)
                 else:
-                    # 文件
-                    if Path(target_file).exists():
-                        logger.info(f"目标文件 {target_file} 已存在")
-                        return
+                    self.__handle_file(event_path, mon_path, self._dirconf.get(mon_path))
 
-                    if not Path(target_file).parent.exists():
-                        logger.info(f"创建目标文件夹 {Path(target_file).parent}")
-                        os.makedirs(Path(target_file).parent)
+            except Exception as e:
+                logger.error(f"{event_path} {text}事件处理失败：{str(e)}")
+                self.systemmessage.put(f"{event_path} {text}事件处理失败：{str(e)}")
 
-                    # 媒体文件软连接
-                    if Path(target_file).suffix in settings.RMT_MEDIAEXT:
-                        retcode, retmsg = SystemUtils.softlink(file_path, Path(target_file))
-                        logger.info(f"创建媒体文件软连接 {str(file_path)} 到 {target_file} {retcode} {retmsg}")
-                    else:
-                        if self._copy_files:
-                            # 其他nfo、jpg等复制文件
-                            shutil.copy2(str(file_path), target_file)
-                            logger.info(f"复制其他文件 {str(file_path)} 到 {target_file}")
-        except Exception as e:
-            logger.error("软连接发生错误：%s - %s" % (str(e), traceback.format_exc()))
-
-    def get_state(self) -> bool:
-        return self._enabled
-
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
+    def __handle_file(self, path: Path, mon_path: str, target_path: Path):
         """
-        定义远程控制命令
-        :return: 命令关键字、事件、描述、附带数据
+        同步单个文件，创建软链接或复制文件
         """
-        return [{
-            "cmd": "/softlink_sync",
-            "event": EventType.PluginAction,
-            "desc": "文件软连接同步",
-            "category": "",
-            "data": {
-                "action": "softlink_sync"
-            }
-        }]
+        # 跳过排除的文件或目录
+        if not path.exists():
+            return
 
-    def get_api(self) -> List[Dict[str, Any]]:
-        return [{
-            "path": "/softlink_sync",
-            "endpoint": self.sync,
-            "methods": ["GET"],
-            "summary": "实时软连接同步",
-            "description": "实时软连接同步",
-        }]
+        # 跳过媒体库目录
+        if any([p in str(path) for p in self._dirconf.values() if p]):
+            return
 
-    def get_service(self) -> List[Dict[str, Any]]:
+        # 创建目的目录
+        relpath = path.relative_to(mon_path)
+        target_file = target_path.joinpath(relpath)
+        target_dir = target_file.parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if target_file.exists():
+            target_file.unlink()
+
+        if self._copy_files:
+            if path.suffix.lower() in MediaType.ALL_VIDEO + MediaType.ALL_SUBTITLE:
+                os.symlink(path, target_file)
+                logger.info(f"已为媒体文件 {path} 创建软链接 {target_file}")
+            else:
+                shutil.copy(path, target_file)
+                logger.info(f"已复制文件 {path} 到 {target_file}")
+        else:
+            os.symlink(path, target_file)
+            logger.info(f"已为文件 {path} 创建软链接 {target_file}")
+
+    def __handle_delete(self, path: Path, mon_path: str):
         """
-        注册插件公共服务
-        [{
-            "id": "服务ID",
-            "name": "服务名称",
-            "trigger": "触发器：cron/interval/date/CronTrigger.from_crontab()",
-            "func": self.xxx,
-            "kwargs": {} # 定时器参数
-        }]
+        删除目标目录中的对应文件
         """
-        if self._enabled and self._cron:
-            return [{
-                "id": "FileSoftLink",
-                "name": "实时软连接全量同步服务",
-                "trigger": CronTrigger.from_crontab(self._cron),
-                "func": self.sync_all,
-                "kwargs": {}
-            }]
-        return []
-
-    def sync(self) -> schemas.Response:
-        """
-        API调用目录同步
-        """
-        self.sync_all()
-        return schemas.Response(success=True)
-
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        return [
-            {
-                'component': 'VForm',
-                'content': [
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'enabled',
-                                            'label': '启用插件',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'onlyonce',
-                                            'label': '立即运行一次',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'copy_files',
-                                            'label': '复制非媒体文件',
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'mode',
-                                            'label': '监控模式',
-                                            'items': [
-                                                {'title': '兼容模式', 'value': 'compatibility'},
-                                                {'title': '性能模式', 'value': 'fast'}
-                                            ]
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'cron',
-                                            'label': '定时全量同步周期',
-                                            'placeholder': '5位cron表达式，留空关闭'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'size',
-                                            'label': '监控文件大小（GB）',
-                                            'placeholder': '0'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'monitor_dirs',
-                                            'label': '监控目录',
-                                            'rows': 5,
-                                            'placeholder': '监控目录:转移目的目录'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'exclude_keywords',
-                                            'label': '排除关键词',
-                                            'rows': 2,
-                                            'placeholder': '每一行一个关键词'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': '监控文件大小：单位GB，0为不开启，低于监控文件大小的文件不会被监控转移。'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        ], {
-            "enabled": False,
-            "onlyonce": False,
-            "copy_files": True,
-            "mode": "compatibility",
-            "monitor_dirs": "",
-            "exclude_keywords": "",
-            "cron": "",
-            "size": 0
-        }
-
-    def get_page(self) -> List[dict]:
-        pass
+        relpath = Path(path).relative_to(mon_path)
+        for target_dir in self._dirconf.values():
+            if target_dir:
+                target_file = target_dir.joinpath(relpath)
+                if target_file.exists():
+                    target_file.unlink()
+                    logger.info(f"已删除文件 {target_file}")
 
     def stop_service(self):
         """
-        退出插件
+        停止服务
         """
-        if self._observer:
-            for observer in self._observer:
-                try:
-                    observer.stop()
-                    observer.join()
-                except Exception as e:
-                    print(str(e))
-        self._observer = []
+        self._event.set()
         if self._scheduler:
             self._scheduler.remove_all_jobs()
-            if self._scheduler.running:
-                self._event.set()
-                self._scheduler.shutdown()
-                self._event.clear()
-            self._scheduler = None
+            self._scheduler.shutdown()
+        for observer in self._observer:
+            observer.stop()
+            observer.join()
+        self._observer = []
+
+    def get_state(self):
+        pass
+
+    def get_command(self):
+        pass
+
+    def get_api(self):
+        pass
+
+    def get_service(self):
+        pass
+
+    def get_form(self):
+        pass
+
+    def get_page(self):
+        pass
